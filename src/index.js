@@ -2,6 +2,12 @@ const MAX_BATCH_SIZE = 1000;
 const MAX_TOP_K = 20;
 const MAX_METADATA_BYTES = 10 * 1024;
 const CHUNK_SIZE = 100;
+const PINECONE_API_VERSION = "2026-04";
+
+
+/* ============================================================================
+ * CORS
+ * ========================================================================== */
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin");
@@ -14,6 +20,11 @@ function corsHeaders(request) {
   };
 }
 
+
+/* ============================================================================
+ * JSON RESPONSE
+ * ========================================================================== */
+
 function json(request, data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -24,11 +35,55 @@ function json(request, data, status = 200) {
   });
 }
 
+
+/* ============================================================================
+ * ERROR HELPERS
+ * ========================================================================== */
+
 function errorMessage(error) {
   return error instanceof Error
     ? error.message
     : String(error);
 }
+
+
+/**
+ * Safely parse a response body.
+ *
+ * Pinecone/Cloudflare can sometimes return plain text or HTML instead
+ * of JSON. Calling response.json() directly causes:
+ *
+ *   Unexpected token 'e' ...
+ *
+ * This function preserves the actual response body.
+ */
+async function parseResponse(response) {
+  const raw = await response.text();
+
+  if (!raw) {
+    return {
+      raw: "",
+      data: null
+    };
+  }
+
+  try {
+    return {
+      raw,
+      data: JSON.parse(raw)
+    };
+  } catch {
+    return {
+      raw,
+      data: null
+    };
+  }
+}
+
+
+/* ============================================================================
+ * PLAIN OBJECT
+ * ========================================================================== */
 
 function isPlainObject(value) {
   if (
@@ -47,11 +102,17 @@ function isPlainObject(value) {
   );
 }
 
+
+/* ============================================================================
+ * METADATA
+ * ========================================================================== */
+
 function metadataSize(metadata) {
   return new TextEncoder()
     .encode(JSON.stringify(metadata))
     .byteLength;
 }
+
 
 function validateMetadata(metadata) {
   if (!isPlainObject(metadata)) {
@@ -74,6 +135,11 @@ function validateMetadata(metadata) {
 
   return null;
 }
+
+
+/* ============================================================================
+ * QUESTION VALIDATION
+ * ========================================================================== */
 
 function validateQuestion(question) {
   if (!isPlainObject(question)) {
@@ -138,63 +204,145 @@ function validateQuestion(question) {
   };
 }
 
-/*
- * Pinecone integrated-embedding upsert.
+
+/* ============================================================================
+ * PINECONE HOST
+ * ========================================================================== */
+
+/**
+ * Normalize the Pinecone host.
  *
- * `text` is sent to Pinecone.
- * Pinecone's llama-text-embed-v2 model performs the embedding.
+ * Accepts:
+ *
+ *   example.svc.xxxxx.pinecone.io
+ *
+ * Also tolerates:
+ *
+ *   https://example.svc.xxxxx.pinecone.io
+ *
+ * but strips the protocol before constructing the request URL.
  */
-async function pineconeUpsert(env, namespace, records) {
-  const url =
-    `https://${env.PINECONE_HOST}` +
-    `/records/namespaces/${encodeURIComponent(namespace)}/upsert`;
+function getPineconeHost(env) {
+  let host = String(env.PINECONE_HOST || "").trim();
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Api-Key": env.PINECONE_API_KEY,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      records
-    })
-  });
-
-  const result = await response.json();
-
-  if (!response.ok) {
+  if (!host) {
     throw new Error(
-      result?.message ||
-      result?.error ||
-      `Pinecone returned HTTP ${response.status}`
+      "PINECONE_HOST is not configured"
     );
   }
 
-  return result;
+  host = host
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+
+  // Prevent Cloudflare Error 1003 caused by using an IP address.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    throw new Error(
+      `PINECONE_HOST must be the Pinecone index hostname, not an IP address: ${host}`
+    );
+  }
+
+  return host;
 }
 
-/*
- * Pinecone integrated-embedding search.
+
+/* ============================================================================
+ * PINECONE UPSERT
  *
- * Pinecone embeds `text` using llama-text-embed-v2
- * and searches the specified namespace.
- */
+ * Pinecone integrated embedding.
+ *
+ * The index must be configured with an integrated embedding model and
+ * a field map pointing to "text".
+ *
+ * Example record:
+ *
+ * {
+ *   "_id": "question-1",
+ *   "text": "What is photosynthesis?",
+ *   "subject": "Biology",
+ *   ...
+ * }
+ *
+ * Pinecone expects NDJSON for this endpoint.
+ * ========================================================================== */
+
+async function pineconeUpsert(env, namespace, records) {
+  const host = getPineconeHost(env);
+
+  const url =
+    `https://${host}` +
+    `/records/namespaces/${encodeURIComponent(namespace)}/upsert`;
+
+  /*
+   * Convert records to NDJSON.
+   *
+   * Each record must occupy its own line.
+   */
+  const ndjson =
+    records
+      .map(record => JSON.stringify(record))
+      .join("\n") + "\n";
+
+  const response = await fetch(url, {
+    method: "POST",
+
+    headers: {
+      "Api-Key": env.PINECONE_API_KEY,
+      "Content-Type": "application/x-ndjson",
+      "X-Pinecone-Api-Version": PINECONE_API_VERSION,
+      "Accept": "application/json"
+    },
+
+    body: ndjson
+  });
+
+  const { raw, data } = await parseResponse(response);
+
+  if (!response.ok) {
+    let message =
+      data?.message ||
+      data?.error ||
+      data?.code ||
+      raw ||
+      `Pinecone returned HTTP ${response.status}`;
+
+    throw new Error(
+      `Pinecone HTTP ${response.status}: ${message}`
+    );
+  }
+
+  return data;
+}
+
+
+/* ============================================================================
+ * PINECONE SEARCH
+ *
+ * Pinecone integrated embedding search.
+ * ========================================================================== */
+
 async function pineconeSearch(
   env,
   namespace,
   text,
   topK
 ) {
+  const host = getPineconeHost(env);
+
   const url =
-    `https://${env.PINECONE_HOST}` +
+    `https://${host}` +
     `/records/namespaces/${encodeURIComponent(namespace)}/search`;
 
   const response = await fetch(url, {
     method: "POST",
+
     headers: {
       "Api-Key": env.PINECONE_API_KEY,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "X-Pinecone-Api-Version": PINECONE_API_VERSION,
+      "Accept": "application/json"
     },
+
     body: JSON.stringify({
       query: {
         top_k: topK,
@@ -205,58 +353,85 @@ async function pineconeSearch(
     })
   });
 
-  const result = await response.json();
+  const { raw, data } = await parseResponse(response);
 
   if (!response.ok) {
+    let message =
+      data?.message ||
+      data?.error ||
+      data?.code ||
+      raw ||
+      `Pinecone returned HTTP ${response.status}`;
+
     throw new Error(
-      result?.message ||
-      result?.error ||
-      `Pinecone returned HTTP ${response.status}`
+      `Pinecone HTTP ${response.status}: ${message}`
     );
   }
 
-  return result;
+  return data;
 }
 
-/*
+
+/* ============================================================================
  * POST /questions
- */
+ * ========================================================================== */
+
 async function handleQuestions(request, env) {
   let body;
 
   try {
     body = await request.json();
   } catch {
-    return json(request, {
-      error: "Malformed JSON"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "Malformed JSON"
+      },
+      400
+    );
   }
 
-  /*
-   * Top-level validation.
-   * No Pinecone writes occur if this fails.
-   */
+
+  /* --------------------------------------------------------------------------
+   * Top-level validation
+   * ------------------------------------------------------------------------ */
+
   if (!isPlainObject(body)) {
-    return json(request, {
-      error: "Request body must be a JSON object"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "Request body must be a JSON object"
+      },
+      400
+    );
   }
+
 
   if (!Array.isArray(body.questions)) {
-    return json(request, {
-      error: "questions must be an array"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "questions must be an array"
+      },
+      400
+    );
   }
+
 
   if (
     body.questions.length < 1 ||
     body.questions.length > MAX_BATCH_SIZE
   ) {
-    return json(request, {
-      error:
-        `questions must contain between 1 and ${MAX_BATCH_SIZE} items`
-    }, 400);
+    return json(
+      request,
+      {
+        error:
+          `questions must contain between 1 and ${MAX_BATCH_SIZE} items`
+      },
+      400
+    );
   }
+
 
   const results = new Array(
     body.questions.length
@@ -264,9 +439,11 @@ async function handleQuestions(request, env) {
 
   const validQuestions = [];
 
-  /*
-   * Validate each question independently.
-   */
+
+  /* --------------------------------------------------------------------------
+   * Validate questions independently
+   * ------------------------------------------------------------------------ */
+
   body.questions.forEach((question, index) => {
     const validation =
       validateQuestion(question);
@@ -290,13 +467,11 @@ async function handleQuestions(request, env) {
     });
   });
 
-  /*
-   * Group questions by metadata.subject.
-   *
-   * Biology → Biology namespace
-   * Chemistry → Chemistry namespace
-   * Physics → Physics namespace
-   */
+
+  /* --------------------------------------------------------------------------
+   * Group questions by subject/namespace
+   * ------------------------------------------------------------------------ */
+
   const groups = new Map();
 
   for (const question of validQuestions) {
@@ -309,9 +484,11 @@ async function handleQuestions(request, env) {
       .push(question);
   }
 
-  /*
-   * Process each namespace independently.
-   */
+
+  /* --------------------------------------------------------------------------
+   * Process each namespace independently
+   * ------------------------------------------------------------------------ */
+
   for (const [namespace, questions] of groups) {
     for (
       let offset = 0;
@@ -323,11 +500,12 @@ async function handleQuestions(request, env) {
         offset + CHUNK_SIZE
       );
 
+
       /*
-       * Pinecone integrated embedding expects
-       * `_id` and `text`.
+       * Pinecone integrated embedding records.
        *
-       * Metadata is stored alongside the record.
+       * "text" is the field Pinecone sends to the
+       * integrated embedding model.
        */
       const records = chunk.map(question => ({
         _id: question.id,
@@ -335,12 +513,18 @@ async function handleQuestions(request, env) {
         ...question.metadata
       }));
 
+
       try {
         await pineconeUpsert(
           env,
           namespace,
           records
         );
+
+
+        /* --------------------------------------------------------------------
+         * Successful records
+         * ------------------------------------------------------------------ */
 
         for (const question of chunk) {
           results[question.index] = {
@@ -350,8 +534,10 @@ async function handleQuestions(request, env) {
         }
 
       } catch (error) {
+
         const message =
           `Pinecone upsert failed: ${errorMessage(error)}`;
+
 
         for (const question of chunk) {
           results[question.index] = {
@@ -364,67 +550,104 @@ async function handleQuestions(request, env) {
     }
   }
 
-  return json(request, {
-    results,
-    mutationId: crypto.randomUUID()
-  });
+
+  return json(
+    request,
+    {
+      results,
+      mutationId: crypto.randomUUID()
+    }
+  );
 }
 
-/*
+
+/* ============================================================================
  * POST /search
- */
+ * ========================================================================== */
+
 async function handleSearch(request, env) {
   let body;
 
   try {
     body = await request.json();
   } catch {
-    return json(request, {
-      error: "Malformed JSON"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "Malformed JSON"
+      },
+      400
+    );
   }
 
+
+  /* --------------------------------------------------------------------------
+   * Top-level validation
+   * ------------------------------------------------------------------------ */
+
   if (!isPlainObject(body)) {
-    return json(request, {
-      error: "Request body must be a JSON object"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "Request body must be a JSON object"
+      },
+      400
+    );
   }
+
 
   if (
     typeof body.text !== "string" ||
     !body.text.trim()
   ) {
-    return json(request, {
-      error: "text must be a non-empty string"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "text must be a non-empty string"
+      },
+      400
+    );
   }
+
 
   if (
     body.topK !== undefined &&
     !Number.isInteger(body.topK)
   ) {
-    return json(request, {
-      error: "topK must be an integer"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "topK must be an integer"
+      },
+      400
+    );
   }
+
 
   const topK = Math.min(
     Math.max(body.topK ?? 5, 1),
     MAX_TOP_K
   );
 
+
   /*
-   * The client must provide the subject because
+   * The client must provide subject because
    * subject determines the Pinecone namespace.
    */
+
   if (
     typeof body.subject !== "string" ||
     !body.subject.trim()
   ) {
-    return json(request, {
-      error: "subject must be a non-empty string"
-    }, 400);
+    return json(
+      request,
+      {
+        error: "subject must be a non-empty string"
+      },
+      400
+    );
   }
+
 
   let result;
 
@@ -435,54 +658,79 @@ async function handleSearch(request, env) {
       body.text,
       topK
     );
+
   } catch (error) {
-    return json(request, {
-      error:
-        `Pinecone search failed: ${errorMessage(error)}`
-    }, 502);
+    return json(
+      request,
+      {
+        error:
+          `Pinecone search failed: ${errorMessage(error)}`
+      },
+      502
+    );
   }
 
-  /*
-   * Pinecone integrated search returns hits.
-   */
-  const matches = (result?.result?.hits || [])
-    .map(hit => ({
-      id: hit._id,
-      score: hit._score,
-      metadata: extractMetadata(hit.fields)
-    }))
-    .sort((a, b) => b.score - a.score);
 
-  return json(request, {
-    matches
-  });
+  /* --------------------------------------------------------------------------
+   * Pinecone integrated search returns hits
+   * ------------------------------------------------------------------------ */
+
+  const matches =
+    (result?.result?.hits || [])
+      .map(hit => ({
+        id: hit._id,
+        score: hit._score,
+        metadata: extractMetadata(hit.fields)
+      }))
+      .sort(
+        (a, b) => b.score - a.score
+      );
+
+
+  return json(
+    request,
+    {
+      matches
+    }
+  );
 }
 
-/*
- * Pinecone integrated-record responses contain the
- * text field alongside metadata fields.
- *
- * We return only the metadata to the client.
- */
+
+/* ============================================================================
+ * EXTRACT METADATA
+ * ========================================================================== */
+
 function extractMetadata(fields) {
-  if (!fields || typeof fields !== "object") {
+  if (
+    !fields ||
+    typeof fields !== "object"
+  ) {
     return {};
   }
 
-  const metadata = { ...fields };
+  const metadata = {
+    ...fields
+  };
 
   delete metadata.text;
 
   return metadata;
 }
 
+
+/* ============================================================================
+ * WORKER
+ * ========================================================================== */
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    /*
-     * CORS preflight.
-     */
+
+    /* ------------------------------------------------------------------------
+     * CORS preflight
+     * ---------------------------------------------------------------------- */
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -490,50 +738,86 @@ export default {
       });
     }
 
-    /*
+
+    /* ------------------------------------------------------------------------
      * POST /questions
-     */
+     * ---------------------------------------------------------------------- */
+
     if (url.pathname === "/questions") {
       if (request.method !== "POST") {
-        return json(request, {
-          error: "Method not allowed"
-        }, 405);
+        return json(
+          request,
+          {
+            error: "Method not allowed"
+          },
+          405
+        );
       }
 
-      return handleQuestions(request, env);
+      return handleQuestions(
+        request,
+        env
+      );
     }
 
-    /*
+
+    /* ------------------------------------------------------------------------
      * POST /search
-     */
+     * ---------------------------------------------------------------------- */
+
     if (url.pathname === "/search") {
       if (request.method !== "POST") {
-        return json(request, {
-          error: "Method not allowed"
-        }, 405);
+        return json(
+          request,
+          {
+            error: "Method not allowed"
+          },
+          405
+        );
       }
 
-      return handleSearch(request, env);
+      return handleSearch(
+        request,
+        env
+      );
     }
 
-    /*
+
+    /* ------------------------------------------------------------------------
      * GET /health
-     */
+     * ---------------------------------------------------------------------- */
+
     if (url.pathname === "/health") {
       if (request.method !== "GET") {
-        return json(request, {
-          error: "Method not allowed"
-        }, 405);
+        return json(
+          request,
+          {
+            error: "Method not allowed"
+          },
+          405
+        );
       }
 
-      return json(request, {
-        status: "ok",
-        service: "utme-questions-worker"
-      });
+      return json(
+        request,
+        {
+          status: "ok",
+          service: "utme-questions-worker"
+        }
+      );
     }
 
-    return json(request, {
-      error: "Not found"
-    }, 404);
+
+    /* ------------------------------------------------------------------------
+     * Not found
+     * ---------------------------------------------------------------------- */
+
+    return json(
+      request,
+      {
+        error: "Not found"
+      },
+      404
+    );
   }
 };
